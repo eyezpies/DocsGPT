@@ -1,6 +1,7 @@
 package com.docsgpt.android.di
 
-import com.docsgpt.android.BuildConfig
+import android.content.Context
+import com.docsgpt.android.data.SettingsRepository
 import com.docsgpt.android.streaming.ChatStreamingRepository
 import com.docsgpt.android.streaming.DefaultChatStreamingRepository
 import com.docsgpt.android.streaming.DocsGptConfig
@@ -11,7 +12,9 @@ import java.util.concurrent.TimeUnit
  * Minimal manual DI container. Kept dependency-free (no Hilt/Dagger) so the streaming
  * repository stays easy to follow end to end; swap this for your DI framework of choice.
  */
-class AppContainer(apiHost: String = BuildConfig.DEFAULT_API_HOST) {
+class AppContainer(context: Context) {
+
+    val settingsRepository: SettingsRepository = SettingsRepository(context.applicationContext)
 
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
         // Chat responses can legitimately stay open for minutes while the LLM generates;
@@ -19,8 +22,7 @@ class AppContainer(apiHost: String = BuildConfig.DEFAULT_API_HOST) {
         .readTimeout(5, TimeUnit.MINUTES)
         .build()
 
-    val chatStreamingRepository: ChatStreamingRepository = DefaultChatStreamingRepository(
-        config = DocsGptConfig(baseUrl = apiHost),
-        client = okHttpClient,
-    )
+    /** The API host is user-configurable at runtime, so the repository is built per-request. */
+    fun chatStreamingRepository(baseUrl: String): ChatStreamingRepository =
+        DefaultChatStreamingRepository(config = DocsGptConfig(baseUrl = baseUrl), client = okHttpClient)
 }
