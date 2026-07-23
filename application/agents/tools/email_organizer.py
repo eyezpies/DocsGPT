@@ -8,14 +8,16 @@ from application.agents.tools.base import Tool
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGES = 500
+IMPORTANT_FLAG = "\\Flagged"
 
 
 class EmailOrganizerTool(Tool):
     """
     Email Organizer & Purger
     Connects to an email account over IMAP to automatically sort messages
-    into folders based on rules, and to purge (archive/delete) messages
-    that match a set of filters (age, sender, subject, read status).
+    into folders based on rules, tag messages by importance, purge junk
+    mail, and purge (archive/delete) messages matching filters (age,
+    sender, subject, read status).
     """
 
     def __init__(self, config):
@@ -26,12 +28,14 @@ class EmailOrganizerTool(Tool):
         self.password = config.get("password", "")
         self.use_ssl = config.get("use_ssl", True) in (True, "true", "True", "1", 1)
         self.trash_folder = config.get("trash_folder", "Trash")
+        self.junk_folder = config.get("junk_folder", "Junk")
 
     def execute_action(self, action_name, **kwargs):
         actions = {
             "email_list_folders": self._list_folders,
             "email_organize": self._organize,
             "email_purge": self._purge,
+            "email_delete_junk": self._delete_junk,
         }
         if action_name not in actions:
             raise ValueError(f"Unknown action: {action_name}")
@@ -139,12 +143,41 @@ class EmailOrganizerTool(Tool):
             return False
         return True
 
+    @staticmethod
+    def _resolve_rule_flags(rule):
+        add_flags = list(rule.get("add_flags") or [])
+        remove_flags = list(rule.get("remove_flags") or [])
+        importance = rule.get("importance")
+        if importance == "important":
+            add_flags.append(IMPORTANT_FLAG)
+        elif importance == "normal":
+            remove_flags.append(IMPORTANT_FLAG)
+        return add_flags, remove_flags
+
+    def _apply_flags(self, imap, uid, add_flags, remove_flags):
+        if add_flags:
+            try:
+                imap.uid("store", uid, "+FLAGS", "(" + " ".join(add_flags) + ")")
+            except imaplib.IMAP4.error:
+                logger.warning("Failed to add flags %s to message %s", add_flags, uid)
+        if remove_flags:
+            try:
+                imap.uid("store", uid, "-FLAGS", "(" + " ".join(remove_flags) + ")")
+            except imaplib.IMAP4.error:
+                logger.warning(
+                    "Failed to remove flags %s from message %s", remove_flags, uid
+                )
+
     def _organize(self, rules, source_folder="INBOX", dry_run=False, limit=200):
         if not rules:
             raise ValueError("At least one rule is required")
         for rule in rules:
-            if not rule.get("target_folder"):
-                raise ValueError("Each rule requires a 'target_folder'")
+            add_flags, remove_flags = self._resolve_rule_flags(rule)
+            if not rule.get("target_folder") and not add_flags and not remove_flags:
+                raise ValueError(
+                    "Each rule requires a 'target_folder', an 'importance', or "
+                    "'add_flags'/'remove_flags' to apply"
+                )
             if not any(
                 rule.get(key)
                 for key in ("sender_contains", "subject_contains", "older_than_days")
@@ -157,7 +190,10 @@ class EmailOrganizerTool(Tool):
         imap = self._connect()
         try:
             messages = self._fetch_headers(imap, source_folder, limit)
-            moved_by_rule = {rule["target_folder"]: 0 for rule in rules}
+            moved_by_rule = {
+                rule["target_folder"]: 0 for rule in rules if rule.get("target_folder")
+            }
+            tagged_count = 0
 
             for message in messages:
                 for rule in rules:
@@ -167,11 +203,23 @@ class EmailOrganizerTool(Tool):
                         subject_contains=rule.get("subject_contains"),
                         older_than_days=rule.get("older_than_days"),
                     ):
-                        target_folder = rule["target_folder"]
-                        moved_by_rule[target_folder] += 1
-                        if not dry_run:
-                            imap.uid("copy", message["uid"], target_folder)
-                            imap.uid("store", message["uid"], "+FLAGS", "(\\Deleted)")
+                        target_folder = rule.get("target_folder")
+                        add_flags, remove_flags = self._resolve_rule_flags(rule)
+
+                        if add_flags or remove_flags:
+                            tagged_count += 1
+                            if not dry_run:
+                                self._apply_flags(
+                                    imap, message["uid"], add_flags, remove_flags
+                                )
+
+                        if target_folder:
+                            moved_by_rule[target_folder] += 1
+                            if not dry_run:
+                                imap.uid("copy", message["uid"], target_folder)
+                                imap.uid(
+                                    "store", message["uid"], "+FLAGS", "(\\Deleted)"
+                                )
                         break
 
             if not dry_run:
@@ -182,6 +230,7 @@ class EmailOrganizerTool(Tool):
                 "dry_run": dry_run,
                 "scanned": len(messages),
                 "moved_by_folder": moved_by_rule,
+                "tagged": tagged_count,
             }
         finally:
             imap.logout()
@@ -219,16 +268,48 @@ class EmailOrganizerTool(Tool):
             ]
 
             if not dry_run:
-                for message in matches:
-                    if not permanent:
-                        imap.uid("copy", message["uid"], self.trash_folder)
-                    imap.uid("store", message["uid"], "+FLAGS", "(\\Deleted)")
-                imap.expunge()
+                self._delete_messages(imap, matches, permanent)
 
             return {
                 "status": "success",
                 "dry_run": dry_run,
                 "permanent": permanent,
+                "scanned": len(messages),
+                "matched": len(matches),
+            }
+        finally:
+            imap.logout()
+
+    def _delete_messages(self, imap, messages, permanent):
+        for message in messages:
+            if not permanent:
+                imap.uid("copy", message["uid"], self.trash_folder)
+            imap.uid("store", message["uid"], "+FLAGS", "(\\Deleted)")
+        imap.expunge()
+
+    def _delete_junk(
+        self, older_than_days=None, permanent=False, dry_run=True, limit=200
+    ):
+        imap = self._connect()
+        try:
+            messages = self._fetch_headers(imap, self.junk_folder, limit)
+            if older_than_days is not None:
+                matches = [
+                    message
+                    for message in messages
+                    if self._matches(message, older_than_days=older_than_days)
+                ]
+            else:
+                matches = messages
+
+            if not dry_run:
+                self._delete_messages(imap, matches, permanent)
+
+            return {
+                "status": "success",
+                "dry_run": dry_run,
+                "permanent": permanent,
+                "folder": self.junk_folder,
                 "scanned": len(messages),
                 "matched": len(matches),
             }
@@ -250,16 +331,21 @@ class EmailOrganizerTool(Tool):
             {
                 "name": "email_organize",
                 "description": (
-                    "Automatically sort messages in a folder into other folders based on "
-                    "rules matching sender, subject, or message age. Set dry_run to true "
-                    "to preview matches without moving anything."
+                    "Automatically sort messages in a folder into other folders and/or tag "
+                    "them by importance, based on rules matching sender, subject, or message "
+                    "age. Set dry_run to true to preview matches without changing anything."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "rules": {
                             "type": "array",
-                            "description": "Ordered list of rules; the first matching rule wins.",
+                            "description": (
+                                "Ordered list of rules; the first matching rule wins. Each "
+                                "rule needs at least one match condition (sender_contains, "
+                                "subject_contains, older_than_days) and at least one action "
+                                "(target_folder, importance, add_flags, or remove_flags)."
+                            ),
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -279,8 +365,26 @@ class EmailOrganizerTool(Tool):
                                         "type": "string",
                                         "description": "Folder to move matching messages into",
                                     },
+                                    "importance": {
+                                        "type": "string",
+                                        "enum": ["important", "normal"],
+                                        "description": (
+                                            "Shorthand for tagging importance: 'important' stars "
+                                            "the message, 'normal' removes the star"
+                                        ),
+                                    },
+                                    "add_flags": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "IMAP flags/keywords to add to matching messages",
+                                    },
+                                    "remove_flags": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "IMAP flags/keywords to remove from matching messages",
+                                    },
                                 },
-                                "required": ["target_folder"],
+                                "required": [],
                             },
                         },
                         "source_folder": {
@@ -350,6 +454,40 @@ class EmailOrganizerTool(Tool):
                     "additionalProperties": False,
                 },
             },
+            {
+                "name": "email_delete_junk",
+                "description": (
+                    "Empty out the configured junk/spam folder. Defaults to a dry run and "
+                    "to moving messages to the trash folder rather than permanently "
+                    "deleting them."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "older_than_days": {
+                            "type": "integer",
+                            "description": "Only delete junk messages older than this many days (default: all)",
+                        },
+                        "permanent": {
+                            "type": "boolean",
+                            "description": (
+                                "If true, delete matches permanently instead of moving "
+                                "them to the trash folder (default false)"
+                            ),
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "If true (default), only report what would be deleted",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": f"Maximum number of recent messages to scan (default 200, max {MAX_MESSAGES})",
+                        },
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
         ]
 
     def get_config_requirements(self):
@@ -396,5 +534,15 @@ class EmailOrganizerTool(Tool):
                 "description": "Folder used when purging without permanent deletion (default Trash)",
                 "required": False,
                 "order": 6,
+            },
+            "junk_folder": {
+                "type": "string",
+                "label": "Junk/Spam Folder",
+                "description": (
+                    "Folder used by email_delete_junk (default Junk; Gmail uses "
+                    "'[Gmail]/Spam')"
+                ),
+                "required": False,
+                "order": 7,
             },
         }
